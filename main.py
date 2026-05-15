@@ -8,6 +8,11 @@ os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
 
 import matplotlib
 
+# ja tenho peso da yolo especifico
+# fzr treinamento em cascata 
+# e: modelo pre treinado
+# s: modelo com fine tuning
+
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -267,6 +272,46 @@ def calculate_metrics(results: pd.DataFrame, labels: Sequence[str]) -> Tuple[pd.
     return pd.DataFrame(metrics_rows), accuracy, report
 
 
+def calculate_confidence_metrics(results: pd.DataFrame, labels: Sequence[str]) -> pd.DataFrame:
+    evaluated = results.copy()
+    evaluated["is_correct"] = evaluated["true_label"] == evaluated["predicted_class"]
+
+    rows = [confidence_summary_row(evaluated, "global")]
+    for label in labels:
+        class_results = evaluated[evaluated["true_label"] == label]
+        rows.append(confidence_summary_row(class_results, label))
+
+    return pd.DataFrame(rows)
+
+
+def confidence_summary_row(results: pd.DataFrame, label: str) -> Dict[str, float]:
+    hits = results[results["is_correct"]]
+    errors = results[~results["is_correct"]]
+
+    return {
+        "class": label,
+        "total_samples": int(len(results)),
+        "hits": int(len(hits)),
+        "errors": int(len(errors)),
+        "confidence_mean_errors": safe_mean(errors["confidence"]),
+        "confidence_mean_hits": safe_mean(hits["confidence"]),
+        "confidence_max": safe_max(results["confidence"]),
+        "confidence_min": safe_min(results["confidence"]),
+    }
+
+
+def safe_mean(values: pd.Series):
+    return float(values.mean()) if not values.empty else None
+
+
+def safe_max(values: pd.Series):
+    return float(values.max()) if not values.empty else None
+
+
+def safe_min(values: pd.Series):
+    return float(values.min()) if not values.empty else None
+
+
 def calculate_specificity(cm):
     total = cm.sum()
     specificities = []
@@ -340,6 +385,7 @@ def print_summary(
     output_dir: Path,
     results: pd.DataFrame,
     metrics: pd.DataFrame,
+    confidence_metrics: pd.DataFrame,
     accuracy: float,
     report: str,
 ):
@@ -352,9 +398,12 @@ def print_summary(
     print(report)
     print("\nResumo macro/weighted:")
     print(metrics[metrics["class"].isin(["macro_avg", "weighted_avg"])].to_string(index=False))
+    print("\nResumo de confianca:")
+    print(confidence_metrics.to_string(index=False))
     print("\nArquivos gerados:")
     print(f"- {output_dir / 'predictions.csv'}")
     print(f"- {output_dir / 'metrics.csv'}")
+    print(f"- {output_dir / 'confidence_metrics.csv'}")
     print(f"- {output_dir / 'classification_report.txt'}")
     print(f"- {output_dir / 'confusion_matrix.png'}")
     print(f"- {output_dir / 'class_distribution.png'}")
@@ -387,10 +436,12 @@ def main():
     metrics, accuracy, report = calculate_metrics(results, metric_labels)
     metrics.insert(1, "accuracy_global", accuracy)
     metrics.to_csv(output_dir / "metrics.csv", index=False)
+    confidence_metrics = calculate_confidence_metrics(results, metric_labels)
+    confidence_metrics.to_csv(output_dir / "confidence_metrics.csv", index=False)
     (output_dir / "classification_report.txt").write_text(report, encoding="utf-8")
 
     save_visualizations(results, metrics, metric_labels, output_dir)
-    print_summary(dataset, output_dir, results, metrics, accuracy, report)
+    print_summary(dataset, output_dir, results, metrics, confidence_metrics, accuracy, report)
 
 
 if __name__ == "__main__":

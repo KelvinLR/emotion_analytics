@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib
 
@@ -28,6 +28,7 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torchvision.transforms import functional as TF
 
 from lib.repvgg import create_RepVGG_A0
 
@@ -110,10 +111,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1), help="Workers do DataLoader.")
     parser.add_argument("--image-size", type=int, default=224, help="Tamanho final da imagem.")
     parser.add_argument(
+        "--centercrop",
+        action="store_true",
+        default=False,
+        help=(
+            "Usa Resize(resize-size) + CenterCrop(image-size) em vez de Resize direto. "
+            "Ative apenas se o modelo foi treinado com esse pipeline."
+        ),
+    )
+    parser.add_argument(
         "--resize-size",
         type=int,
         default=256,
-        help="Resize antes do CenterCrop. Use o mesmo preprocessamento do treino quando souber.",
+        help="Resize antes do CenterCrop (usado apenas com --centercrop).",
     )
     parser.add_argument(
         "--classes",
@@ -121,14 +131,37 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_MODEL_CLASSES),
         help="Ordem das classes da camada de saida do modelo.",
     )
+    parser.add_argument(
+        "--tta",
+        action="store_true",
+        default=True,
+        help="Test Time Augmentation: media de predicoes com flip e rotacoes (ativo por padrao).",
+    )
+    parser.add_argument(
+        "--no-tta",
+        dest="tta",
+        action="store_false",
+        help="Desativa TTA.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Dispositivo de inferencia: 'cuda', 'cpu'. Auto-detectado se omitido.",
+    )
     return parser.parse_args()
 
 
-def build_transform(resize_size: int, image_size: int):
+def build_transform(image_size: int, use_centercrop: bool = False, resize_size: int = 256):
+    if use_centercrop:
+        spatial = [transforms.Resize(resize_size), transforms.CenterCrop(image_size)]
+    else:
+        # Redimensionamento direto preserva toda a região facial sem corte lateral.
+        # Preferível para datasets de recortes de face (ex: FER2013 48x48).
+        spatial = [transforms.Resize((image_size, image_size))]
     return transforms.Compose(
         [
-            transforms.Resize(resize_size),
-            transforms.CenterCrop(image_size),
+            *spatial,
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
@@ -140,7 +173,7 @@ def load_repvgg(weights_path: Path, device: torch.device) -> torch.nn.Module:
         raise FileNotFoundError(f"Pesos nao encontrados: {weights_path}")
 
     model = create_RepVGG_A0(deploy=True)
-    checkpoint = torch.load(weights_path, map_location=device)
+    checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
     state_dict = extract_state_dict(checkpoint)
     state_dict = strip_module_prefix(state_dict)
     model.load_state_dict(state_dict)
@@ -167,19 +200,48 @@ def strip_module_prefix(state_dict):
     }
 
 
+def _to_probs(outputs: torch.Tensor) -> torch.Tensor:
+    """Garante que a saída do modelo seja uma distribuição de probabilidades."""
+    row_sums = outputs.sum(dim=1)
+    is_prob = bool(
+        torch.all(outputs >= 0)
+        and torch.all(outputs <= 1)
+        and torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3)
+    )
+    return outputs if is_prob else torch.softmax(outputs, dim=1)
+
+
+def _tta_variants(images: torch.Tensor) -> List[torch.Tensor]:
+    """Gera variantes augmentadas para TTA. Usa somente flip e rotações leves."""
+    return [
+        torch.flip(images, dims=[3]),           # espelho horizontal
+        TF.rotate(images, angle=5, fill=0),     # rotação +5°
+        TF.rotate(images, angle=-5, fill=0),    # rotação -5°
+    ]
+
+
 @torch.inference_mode()
 def run_inference(
     model: torch.nn.Module,
     dataloader: DataLoader,
     model_classes: Sequence[str],
     device: torch.device,
+    tta: bool = True,
 ) -> pd.DataFrame:
     rows = []
 
     for images, true_labels, folder_labels, paths, file_names in dataloader:
         images = images.to(device)
-        outputs = model(images)
-        probabilities = outputs if outputs_are_probabilities(outputs) else torch.softmax(outputs, dim=1)
+
+        # Predição base
+        probabilities = _to_probs(model(images))
+
+        # TTA: média com variantes augmentadas
+        if tta:
+            for variant in _tta_variants(images):
+                probabilities = probabilities + _to_probs(model(variant))
+            probabilities = probabilities / (1 + len(_tta_variants(images)))
+
         confidences, predicted_indices = torch.max(probabilities, dim=1)
 
         probabilities = probabilities.cpu().tolist()
@@ -413,12 +475,14 @@ def print_summary(
 
 def main():
     args = parse_args()
-    device = torch.device("cpu")
+    _dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(_dev)
+    print(f"Dispositivo de inferencia: {device}")
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_classes = tuple(args.classes)
-    transform = build_transform(args.resize_size, args.image_size)
+    transform = build_transform(args.image_size, use_centercrop=args.centercrop, resize_size=args.resize_size)
     dataset = EmotionFolderDataset(args.dataset, transform=transform, label_aliases=LABEL_ALIASES)
     dataloader = DataLoader(
         dataset,
@@ -429,7 +493,8 @@ def main():
     )
 
     model = load_repvgg(args.weights, device)
-    results = run_inference(model, dataloader, model_classes, device)
+    print(f"TTA: {'ativado (flip + rot ±5°)' if args.tta else 'desativado'}")
+    results = run_inference(model, dataloader, model_classes, device, tta=args.tta)
     results.to_csv(output_dir / "predictions.csv", index=False)
 
     metric_labels = list(dict.fromkeys([*model_classes, *dataset.labels]))

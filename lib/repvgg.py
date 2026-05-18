@@ -156,7 +156,9 @@ class RepVGG(nn.Module):
         out = self.gap(out)
         out = out.view(out.size(0), -1)
         out = self.linear(out)
-        out = self.softmax(out)
+        # Softmax apenas em inferência — em treino retorna logits para CrossEntropyLoss
+        if not self.training:
+            out = self.softmax(out)
         return out
 
 

@@ -208,7 +208,20 @@ class EmotionProcessor(BaseAnalyticProcessor):
             
             # Load weights
             if os.path.exists(self.emotion_model_path):
-                model.load_state_dict(torch.load(self.emotion_model_path, map_location=self.device))
+                checkpoint = torch.load(self.emotion_model_path, map_location=self.device, weights_only=False)
+                # Extrai state_dict de checkpoints com wrapper (ex: {'state_dict': {...}})
+                if isinstance(checkpoint, dict):
+                    for key in ("state_dict", "model_state_dict", "model", "net"):
+                        inner = checkpoint.get(key)
+                        if isinstance(inner, dict):
+                            checkpoint = inner
+                            break
+                # Remove prefixo 'module.' gerado por DataParallel
+                checkpoint = {
+                    (k[len("module."):] if k.startswith("module.") else k): v
+                    for k, v in checkpoint.items()
+                }
+                model.load_state_dict(checkpoint)
                 cudnn.benchmark = True
                 model.eval()
                 
@@ -216,8 +229,9 @@ class EmotionProcessor(BaseAnalyticProcessor):
                 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                std=[0.229, 0.224, 0.225])
                 transform = transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
+                    # Resize direto preserva a face inteira detectada pelo YOLO;
+                    # CenterCrop cortaria features faciais laterais importantes.
+                    transforms.Resize((224, 224)),
                     transforms.ToTensor(),
                     normalize,
                 ])
@@ -226,7 +240,7 @@ class EmotionProcessor(BaseAnalyticProcessor):
                 return {
                     'model': model,
                     'transform': transform,
-                    'emotions': ("anger", "contempt", "disgusted", "fear", "happy", "neutral", "sad", "surprise"),
+                    'emotions': ("anger", "contempt", "disgust", "fear", "happy", "neutral", "sad", "surprise"),
                     'torch': torch,
                     'Image': Image
                 }
